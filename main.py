@@ -1,0 +1,555 @@
+import base64
+import datetime as dt
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from typing import Any
+
+import cloudscraper
+
+
+DEFAULT_CONTAINER = "sub2api-postgres"
+DEFAULT_DB_USER = "sub2api"
+DEFAULT_DB_NAME = "sub2api"
+DEFAULT_GROUP_NAME = "openai-default"
+DEFAULT_CONCURRENCY = 10
+DEFAULT_PRIORITY = 1
+REVOKED_ERROR = (
+    "Token revoked (401): Your authentication token has been invalidated. "
+    "Please try signing in again."
+)
+
+
+@dataclass
+class DbConfig:
+    container: str
+    user: str
+    db: str
+    group_name: str
+    concurrency: int
+    priority: int
+    dry_run: bool
+
+
+@dataclass
+class PsqlOptions:
+    quiet: bool = False
+    tuples_only: bool = False
+    unaligned: bool = False
+
+
+def env_flag(name: str) -> bool:
+    return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
+
+
+def db_config() -> DbConfig:
+    return DbConfig(
+        container=os.environ.get("POSTGRES_CONTAINER", DEFAULT_CONTAINER),
+        user=os.environ.get("POSTGRES_USER", DEFAULT_DB_USER),
+        db=os.environ.get("POSTGRES_DB", DEFAULT_DB_NAME),
+        group_name=os.environ.get("GROUP_NAME", DEFAULT_GROUP_NAME),
+        concurrency=int(os.environ.get("ACCOUNT_CONCURRENCY", DEFAULT_CONCURRENCY)),
+        priority=int(os.environ.get("ACCOUNT_PRIORITY", DEFAULT_PRIORITY)),
+        dry_run=env_flag("DRY_RUN"),
+    )
+
+
+def normalize_token(token: str) -> str:
+    token = token.replace("\r", "").strip()
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    return token
+
+
+def jwt_payload(token: str) -> dict[str, Any]:
+    parts = token.split(".")
+    if len(parts) < 2:
+        raise ValueError("access token does not look like a JWT")
+
+    payload = parts[1] + "=" * ((4 - len(parts[1]) % 4) % 4)
+    try:
+        return json.loads(base64.urlsafe_b64decode(payload))
+    except Exception as exc:
+        raise ValueError(f"failed to decode access token payload: {exc}") from exc
+
+
+def token_record(data: dict[str, Any]) -> dict[str, Any]:
+    access_token = normalize_token(str(data.get("accessToken") or data.get("access_token") or ""))
+    session_token = str(data.get("sessionToken") or data.get("session_token") or "").strip()
+    if not access_token:
+        raise ValueError(f"response does not contain accessToken: {data}")
+    if not session_token:
+        raise ValueError(f"response does not contain sessionToken: {data}")
+
+    claims = jwt_payload(access_token)
+    profile = claims.get("https://api.openai.com/profile") or {}
+    auth = claims.get("https://api.openai.com/auth") or {}
+    if not isinstance(profile, dict):
+        profile = {}
+    if not isinstance(auth, dict):
+        auth = {}
+
+    email = profile.get("email") or claims.get("email")
+    exp = claims.get("exp")
+    if not email:
+        raise ValueError("no email found in access token claims")
+    if not isinstance(exp, int):
+        raise ValueError("no numeric exp found in access token claims")
+
+    result: dict[str, Any] = {
+        "access_token": access_token,
+        "session_token": session_token,
+        "access_token_sha256": hashlib.sha256(access_token.encode()).hexdigest(),
+        "session_token_sha256": hashlib.sha256(session_token.encode()).hexdigest(),
+        "email": email,
+        "exp": exp,
+        "expires_at_utc": dt.datetime.fromtimestamp(exp, dt.UTC).isoformat(),
+    }
+
+    optional = {
+        "id_token": data.get("idToken") or data.get("id_token"),
+        "client_id": claims.get("client_id"),
+        "chatgpt_user_id": auth.get("chatgpt_user_id") or auth.get("user_id"),
+        "chatgpt_account_id": auth.get("chatgpt_account_id"),
+        "plan_type": auth.get("chatgpt_plan_type"),
+        "organization_id": claims.get("organization_id") or auth.get("organization_id"),
+    }
+    for key, value in optional.items():
+        if value is not None:
+            result[key] = value
+
+    return result
+
+
+def fetch_chatgpt_session(session_token: str, max_retries: int = 3) -> dict[str, Any]:
+    """Return the full ChatGPT auth session response."""
+    scraper = cloudscraper.create_scraper()
+    last_err: Exception | None = None
+    for attempt in range(max_retries):
+        if attempt > 0:
+            time.sleep(2**attempt)
+        try:
+            resp = scraper.get(
+                "https://chatgpt.com/api/auth/session",
+                cookies={"__Secure-next-auth.session-token": session_token},
+                timeout=15,
+            )
+        except Exception as exc:
+            last_err = exc
+            continue
+
+        if resp.status_code != 200:
+            last_err = RuntimeError(f"request failed (status {resp.status_code}): {resp.text}")
+            continue
+
+        data = resp.json()
+        if not data.get("accessToken"):
+            raise ValueError(f"response does not contain accessToken; token may be invalid: {data}")
+        if not data.get("sessionToken"):
+            raise ValueError(f"response does not contain sessionToken: {data}")
+
+        return data
+
+    raise RuntimeError(f"failed after {max_retries} retries: {last_err}")
+
+
+def run_psql(sql: str, cfg: DbConfig, options: PsqlOptions | None = None) -> str:
+    options = options or PsqlOptions()
+    subprocess.run(["docker", "inspect", cfg.container], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    subprocess.run(
+        ["docker", "exec", cfg.container, "pg_isready", "-U", cfg.user, "-d", cfg.db],
+        stdout=subprocess.DEVNULL,
+        check=True,
+    )
+
+    cmd = [
+        "docker",
+        "exec",
+        "-i",
+        cfg.container,
+        "psql",
+        "-U",
+        cfg.user,
+        "-d",
+        cfg.db,
+        "-X",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-v",
+        f"group_name={cfg.group_name}",
+        "-v",
+        f"account_concurrency={cfg.concurrency}",
+        "-v",
+        f"account_priority={cfg.priority}",
+    ]
+    if cfg.dry_run:
+        cmd += ["-v", "dry_run=1"]
+    if options.quiet:
+        cmd.append("-q")
+    if options.tuples_only:
+        cmd.append("-t")
+    if options.unaligned:
+        cmd.append("-A")
+    cmd += ["-f", "-"]
+
+    proc = subprocess.run(cmd, input=sql, text=True, capture_output=True)
+    if proc.returncode != 0:
+        message = proc.stderr.strip() or proc.stdout.strip()
+        raise RuntimeError(message)
+    return proc.stdout
+
+
+def upsert_record(record: dict[str, Any], cfg: DbConfig, target_account_id: int | None = None) -> str:
+    sql = r"""
+BEGIN;
+
+CREATE TEMP TABLE _sub2api_st_input(payload jsonb) ON COMMIT DROP;
+
+\copy _sub2api_st_input(payload) FROM stdin
+"""
+    sql += json.dumps(record, separators=(",", ":")) + "\n\\.\n"
+    target_clause = (
+        f"a.id = {target_account_id}"
+        if target_account_id is not None
+        else """(
+      lower(a.name) = lower(i.email)
+      OR lower(a.credentials->>'email') = lower(i.email)
+      OR lower(a.extra->>'email') = lower(i.email)
+    )"""
+    )
+    sql += r"""
+WITH
+input AS (
+  SELECT
+    payload AS p,
+    payload->>'email' AS email,
+    (payload->>'exp')::bigint AS exp,
+    to_timestamp((payload->>'exp')::double precision) AS expires_at
+  FROM _sub2api_st_input
+),
+model AS (
+  SELECT COALESCE(
+    (
+      SELECT credentials->'model_mapping'
+      FROM public.accounts
+      WHERE platform = 'openai'
+        AND type = 'oauth'
+        AND deleted_at IS NULL
+        AND credentials ? 'model_mapping'
+      ORDER BY id DESC
+      LIMIT 1
+    ),
+    '{}'::jsonb
+  ) AS model_mapping
+),
+targets AS (
+  SELECT a.id
+  FROM public.accounts a
+  CROSS JOIN input i
+  WHERE a.deleted_at IS NULL
+    AND a.platform = 'openai'
+    AND a.type = 'oauth'
+    AND TARGET_CLAUSE
+),
+updated AS (
+  UPDATE public.accounts a
+  SET
+    name = i.email,
+    credentials =
+      a.credentials
+      || jsonb_build_object(
+        'access_token', i.p->>'access_token',
+        'session_token', i.p->>'session_token',
+        'expires_at', i.exp,
+        'email', i.email,
+        'model_mapping', COALESCE(a.credentials->'model_mapping', m.model_mapping)
+      )
+      || CASE WHEN i.p ? 'id_token' THEN jsonb_build_object('id_token', i.p->>'id_token') ELSE '{}'::jsonb END
+      || CASE WHEN i.p ? 'client_id' THEN jsonb_build_object('client_id', i.p->>'client_id') ELSE '{}'::jsonb END
+      || CASE WHEN i.p ? 'chatgpt_user_id' THEN jsonb_build_object('chatgpt_user_id', i.p->>'chatgpt_user_id') ELSE '{}'::jsonb END
+      || CASE WHEN i.p ? 'chatgpt_account_id' THEN jsonb_build_object('chatgpt_account_id', i.p->>'chatgpt_account_id') ELSE '{}'::jsonb END
+      || CASE WHEN i.p ? 'plan_type' THEN jsonb_build_object('plan_type', i.p->>'plan_type') ELSE '{}'::jsonb END
+      || CASE WHEN i.p ? 'organization_id' THEN jsonb_build_object('organization_id', i.p->>'organization_id') ELSE '{}'::jsonb END,
+    extra =
+      a.extra
+      || jsonb_build_object(
+        'email', i.email,
+        'access_token_sha256', i.p->>'access_token_sha256',
+        'session_token_sha256', i.p->>'session_token_sha256',
+        'session_token_updated_at', now()
+      )
+      || CASE WHEN NOT (a.extra ? 'privacy_mode') THEN jsonb_build_object('privacy_mode', 'training_off') ELSE '{}'::jsonb END
+      || CASE WHEN NOT (a.extra ? 'openai_oauth_responses_websockets_v2_enabled') THEN jsonb_build_object('openai_oauth_responses_websockets_v2_enabled', false) ELSE '{}'::jsonb END
+      || CASE WHEN NOT (a.extra ? 'openai_oauth_responses_websockets_v2_mode') THEN jsonb_build_object('openai_oauth_responses_websockets_v2_mode', 'off') ELSE '{}'::jsonb END,
+    expires_at = i.expires_at,
+    status = 'active',
+    error_message = NULL,
+    schedulable = true,
+    rate_limited_at = NULL,
+    rate_limit_reset_at = NULL,
+    temp_unschedulable_until = NULL,
+    temp_unschedulable_reason = NULL,
+    updated_at = now()
+  FROM input i, model m, targets t
+  WHERE a.id = t.id
+  RETURNING 'updated'::text AS action, a.id, a.name, a.expires_at
+),
+inserted AS (
+  INSERT INTO public.accounts (
+    name,
+    platform,
+    type,
+    credentials,
+    extra,
+    concurrency,
+    priority,
+    status,
+    schedulable,
+    expires_at,
+    auto_pause_on_expired,
+    rate_multiplier,
+    created_at,
+    updated_at
+  )
+  SELECT
+    i.email,
+    'openai',
+    'oauth',
+    jsonb_build_object(
+      'access_token', i.p->>'access_token',
+      'session_token', i.p->>'session_token',
+      'expires_at', i.exp,
+      'email', i.email,
+      'model_mapping', m.model_mapping
+    )
+    || CASE WHEN i.p ? 'id_token' THEN jsonb_build_object('id_token', i.p->>'id_token') ELSE '{}'::jsonb END
+    || CASE WHEN i.p ? 'client_id' THEN jsonb_build_object('client_id', i.p->>'client_id') ELSE '{}'::jsonb END
+    || CASE WHEN i.p ? 'chatgpt_user_id' THEN jsonb_build_object('chatgpt_user_id', i.p->>'chatgpt_user_id') ELSE '{}'::jsonb END
+    || CASE WHEN i.p ? 'chatgpt_account_id' THEN jsonb_build_object('chatgpt_account_id', i.p->>'chatgpt_account_id') ELSE '{}'::jsonb END
+    || CASE WHEN i.p ? 'plan_type' THEN jsonb_build_object('plan_type', i.p->>'plan_type') ELSE '{}'::jsonb END
+    || CASE WHEN i.p ? 'organization_id' THEN jsonb_build_object('organization_id', i.p->>'organization_id') ELSE '{}'::jsonb END,
+    jsonb_build_object(
+      'email', i.email,
+      'access_token_sha256', i.p->>'access_token_sha256',
+      'session_token_sha256', i.p->>'session_token_sha256',
+      'privacy_mode', 'training_off',
+      'openai_oauth_responses_websockets_v2_enabled', false,
+      'openai_oauth_responses_websockets_v2_mode', 'off',
+      'import_source', 'session_token_helper',
+      'imported_at', now(),
+      'session_token_updated_at', now()
+    ),
+    :'account_concurrency'::integer,
+    :'account_priority'::integer,
+    'active',
+    true,
+    i.expires_at,
+    true,
+    1.0,
+    now(),
+    now()
+  FROM input i, model m
+  WHERE NOT EXISTS (SELECT 1 FROM targets)
+  RETURNING 'inserted'::text AS action, id, name, expires_at
+),
+result AS (
+  SELECT * FROM updated
+  UNION ALL
+  SELECT * FROM inserted
+),
+group_write AS (
+  INSERT INTO public.account_groups (account_id, group_id, priority)
+  SELECT r.id, g.id, :'account_priority'::integer
+  FROM result r
+  JOIN public.groups g ON g.name = :'group_name'
+  ON CONFLICT (account_id, group_id)
+  DO UPDATE SET priority = EXCLUDED.priority
+  RETURNING account_id
+)
+SELECT
+  r.action,
+  r.id,
+  r.name AS email,
+  to_char(r.expires_at AT TIME ZONE 'Asia/Shanghai', 'YYYY-MM-DD HH24:MI:SS') || ' Asia/Shanghai' AS expires_at,
+  CASE WHEN gw.account_id IS NULL THEN 'missing:' || :'group_name' ELSE :'group_name' END AS group_name
+FROM result r
+LEFT JOIN group_write gw ON gw.account_id = r.id
+ORDER BY r.id;
+
+\if :{?dry_run}
+ROLLBACK;
+\else
+COMMIT;
+\endif
+"""
+    sql = sql.replace("TARGET_CLAUSE", target_clause)
+    return run_psql(sql, cfg)
+
+
+def revoked_accounts(cfg: DbConfig) -> list[dict[str, Any]]:
+    sql = f"""
+SELECT jsonb_build_object(
+  'ord', row_number() OVER (ORDER BY id),
+  'id', id,
+  'name', name,
+  'session_token', credentials->>'session_token',
+  'updated_at', updated_at
+)::text
+FROM public.accounts
+WHERE deleted_at IS NULL
+  AND platform = 'openai'
+  AND type = 'oauth'
+  AND error_message = {sql_literal(REVOKED_ERROR)}
+  AND credentials ? 'session_token'
+  AND COALESCE(credentials->>'session_token', '') <> ''
+ORDER BY id;
+"""
+    out = run_psql(sql, cfg, PsqlOptions(quiet=True, tuples_only=True, unaligned=True))
+    accounts = []
+    for line in out.splitlines():
+        line = line.strip()
+        if line and line not in {"BEGIN", "COMMIT"}:
+            accounts.append(json.loads(line))
+    return accounts
+
+
+def sql_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def parse_selection(raw: str, total: int) -> list[int]:
+    raw = raw.strip().lower()
+    if raw == "all":
+        return list(range(1, total + 1))
+    if not raw:
+        return [1]
+
+    selected: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_raw, end_raw = part.split("-", 1)
+            start = int(start_raw)
+            end = int(end_raw)
+            selected.extend(range(start, end + 1))
+        else:
+            selected.append(int(part))
+
+    deduped = []
+    seen = set()
+    for item in selected:
+        if item < 1 or item > total:
+            raise ValueError(f"selection {item} is out of range 1..{total}")
+        if item not in seen:
+            seen.add(item)
+            deduped.append(item)
+    return deduped
+
+
+def update_revoked(selection: str, cfg: DbConfig) -> int:
+    accounts = revoked_accounts(cfg)
+    if not accounts:
+        print("No revoked OpenAI OAuth accounts with session_token found.")
+        return 0
+
+    selected_ord = set(parse_selection(selection, len(accounts)))
+    selected = [account for account in accounts if account["ord"] in selected_ord]
+
+    for account in accounts:
+        marker = "*" if account["ord"] in selected_ord else " "
+        print(f"{marker} {account['ord']}. id={account['id']} {account['name']}")
+
+    failures = 0
+    for account in selected:
+        print(f"Updating {account['ord']}. id={account['id']} {account['name']} ...")
+        try:
+            data = fetch_chatgpt_session(account["session_token"])
+            record = token_record(data)
+        except Exception as exc:
+            failures += 1
+            print(f"ERROR id={account['id']} {account['name']}: {exc}", file=sys.stdout)
+            continue
+
+        print(upsert_record(record, cfg, target_account_id=int(account["id"])), end="")
+
+    return 1 if failures else 0
+
+
+def print_conversion(session_token: str) -> None:
+    data = fetch_chatgpt_session(session_token)
+    print(json.dumps(data, indent=2, ensure_ascii=False))
+    print()
+    print(f"AT={data['accessToken']}")
+    print(f"ST={data.get('sessionToken', '')}")
+
+
+def read_token_arg(args: list[str], label: str) -> str:
+    if args:
+        token = args[0]
+    elif sys.stdin.isatty():
+        token = input(f"{label}: ")
+    else:
+        token = sys.stdin.readline()
+    token = token.strip()
+    if not token:
+        raise ValueError(f"{label} cannot be empty")
+    return token
+
+
+def usage() -> None:
+    print(
+        """Usage:
+  sub2api-helper <session_token>             Upsert OpenAI OAuth account from ChatGPT session token
+  sub2api-helper update [1|1,2,3|1-3|all]    Refresh revoked DB accounts that have session_token
+  sub2api-helper convert <session_token>     Only print ChatGPT session response
+
+Environment:
+  POSTGRES_CONTAINER=sub2api-postgres
+  POSTGRES_USER=sub2api
+  POSTGRES_DB=sub2api
+  GROUP_NAME=openai-default
+  ACCOUNT_CONCURRENCY=10
+  ACCOUNT_PRIORITY=1
+  DRY_RUN=1
+"""
+    )
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    if not args or args[0] in {"-h", "--help", "help"}:
+        usage()
+        return
+
+    cfg = db_config()
+    command = args[0]
+    try:
+        if command == "convert":
+            print_conversion(read_token_arg(args[1:], "ST"))
+            return
+
+        if command == "update":
+            selection = args[1] if len(args) > 1 else "1"
+            if len(args) > 2:
+                raise ValueError("too many arguments for update")
+            raise SystemExit(update_revoked(selection, cfg))
+
+        if len(args) > 1:
+            raise ValueError("too many arguments")
+
+        data = fetch_chatgpt_session(read_token_arg(args, "ST"))
+        record = token_record(data)
+        print(upsert_record(record, cfg), end="")
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+
+
+if __name__ == "__main__":
+    main()

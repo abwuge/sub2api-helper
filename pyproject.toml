@@ -1,0 +1,24 @@
+[project]
+name = "sub2api-helper"
+version = "0.1.0"
+description = "Helper CLI for maintaining sub2api OpenAI OAuth accounts"
+requires-python = ">=3.10"
+dependencies = [
+    "cloudscraper>=1.2.71",
+    "typing-extensions>=4.15.0",
+]
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.14.0",
+]
+
+[project.scripts]
+sub2api-helper = "main:main"
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["main"]

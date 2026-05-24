@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux-x86_64:
+    name: Build Linux x86_64
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version-file: ".python-version"
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Build binary
+        run: |
+          uv run pyinstaller \
+            --clean \
+            --onefile \
+            --name sub2api-helper \
+            --collect-data cloudscraper \
+            main.py
+          tar -C dist -czf sub2api-helper-linux-x86_64.tar.gz sub2api-helper
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sub2api-helper-linux-x86_64
+          path: sub2api-helper-linux-x86_64.tar.gz
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: sub2api-helper-linux-x86_64.tar.gz
