@@ -4,6 +4,8 @@ Small helper CLI for maintaining OpenAI OAuth accounts in a Docker-deployed sub2
 
 Currently only the Docker deployment mode is implemented. The helper talks to the PostgreSQL container through `docker exec`.
 
+ChatGPT session requests use [`zinzied/cloudscraper`](https://github.com/zinzied/cloudscraper).
+
 ## Usage
 
 Run it on the host where sub2api is deployed:

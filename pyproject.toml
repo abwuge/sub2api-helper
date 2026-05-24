@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Helper CLI for maintaining sub2api OpenAI OAuth accounts"
 requires-python = ">=3.10"
 dependencies = [
-    "cloudscraper>=1.2.71",
+    "ai-cloudscraper @ git+https://github.com/zinzied/cloudscraper.git@cb8323b9357a5e39708bb110bfeb6113dd7cb8a1",
     "typing-extensions>=4.15.0",
 ]
 
