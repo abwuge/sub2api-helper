@@ -18,6 +18,7 @@ DEFAULT_DB_NAME = "sub2api"
 DEFAULT_GROUP_NAME = "openai-default"
 DEFAULT_CONCURRENCY = 10
 DEFAULT_PRIORITY = 1
+DEFAULT_PSQL_TIMEOUT = 30
 REVOKED_ERROR = (
     "Token revoked (401): Your authentication token has been invalidated. "
     "Please try signing in again."
@@ -33,6 +34,7 @@ class DbConfig:
     concurrency: int
     priority: int
     dry_run: bool
+    psql_timeout: int
 
 
 @dataclass
@@ -55,6 +57,7 @@ def db_config() -> DbConfig:
         concurrency=int(os.environ.get("ACCOUNT_CONCURRENCY", DEFAULT_CONCURRENCY)),
         priority=int(os.environ.get("ACCOUNT_PRIORITY", DEFAULT_PRIORITY)),
         dry_run=env_flag("DRY_RUN"),
+        psql_timeout=int(os.environ.get("PSQL_TIMEOUT", DEFAULT_PSQL_TIMEOUT)),
     )
 
 
@@ -77,13 +80,10 @@ def jwt_payload(token: str) -> dict[str, Any]:
         raise ValueError(f"failed to decode access token payload: {exc}") from exc
 
 
-def token_record(data: dict[str, Any]) -> dict[str, Any]:
-    access_token = normalize_token(str(data.get("accessToken") or data.get("access_token") or ""))
-    session_token = str(data.get("sessionToken") or data.get("session_token") or "").strip()
+def access_token_record(access_token: str) -> dict[str, Any]:
+    access_token = normalize_token(access_token)
     if not access_token:
-        raise ValueError(f"response does not contain accessToken: {data}")
-    if not session_token:
-        raise ValueError(f"response does not contain sessionToken: {data}")
+        raise ValueError("access token cannot be empty")
 
     claims = jwt_payload(access_token)
     profile = claims.get("https://api.openai.com/profile") or {}
@@ -102,16 +102,13 @@ def token_record(data: dict[str, Any]) -> dict[str, Any]:
 
     result: dict[str, Any] = {
         "access_token": access_token,
-        "session_token": session_token,
         "access_token_sha256": hashlib.sha256(access_token.encode()).hexdigest(),
-        "session_token_sha256": hashlib.sha256(session_token.encode()).hexdigest(),
         "email": email,
         "exp": exp,
         "expires_at_utc": dt.datetime.fromtimestamp(exp, dt.UTC).isoformat(),
     }
 
     optional = {
-        "id_token": data.get("idToken") or data.get("id_token"),
         "client_id": claims.get("client_id"),
         "chatgpt_user_id": auth.get("chatgpt_user_id") or auth.get("user_id"),
         "chatgpt_account_id": auth.get("chatgpt_account_id"),
@@ -122,6 +119,23 @@ def token_record(data: dict[str, Any]) -> dict[str, Any]:
         if value is not None:
             result[key] = value
 
+    return result
+
+
+def token_record(data: dict[str, Any]) -> dict[str, Any]:
+    access_token = normalize_token(str(data.get("accessToken") or data.get("access_token") or ""))
+    session_token = str(data.get("sessionToken") or data.get("session_token") or "").strip()
+    if not access_token:
+        raise ValueError(f"response does not contain accessToken: {data}")
+    if not session_token:
+        raise ValueError(f"response does not contain sessionToken: {data}")
+
+    result = access_token_record(access_token)
+    result["session_token"] = session_token
+    result["session_token_sha256"] = hashlib.sha256(session_token.encode()).hexdigest()
+    id_token = data.get("idToken") or data.get("id_token")
+    if id_token is not None:
+        result["id_token"] = id_token
     return result
 
 
@@ -159,13 +173,6 @@ def fetch_chatgpt_session(session_token: str, max_retries: int = 3) -> dict[str,
 
 def run_psql(sql: str, cfg: DbConfig, options: PsqlOptions | None = None) -> str:
     options = options or PsqlOptions()
-    subprocess.run(["docker", "inspect", cfg.container], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-    subprocess.run(
-        ["docker", "exec", cfg.container, "pg_isready", "-U", cfg.user, "-d", cfg.db],
-        stdout=subprocess.DEVNULL,
-        check=True,
-    )
-
     cmd = [
         "docker",
         "exec",
@@ -196,14 +203,36 @@ def run_psql(sql: str, cfg: DbConfig, options: PsqlOptions | None = None) -> str
         cmd.append("-A")
     cmd += ["-f", "-"]
 
-    proc = subprocess.run(cmd, input=sql, text=True, capture_output=True)
+    try:
+        proc = subprocess.run(cmd, input=sql, text=True, capture_output=True, timeout=cfg.psql_timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"psql command timed out after {cfg.psql_timeout}s") from exc
+
     if proc.returncode != 0:
         message = proc.stderr.strip() or proc.stdout.strip()
         raise RuntimeError(message)
     return proc.stdout
 
 
-def upsert_record(record: dict[str, Any], cfg: DbConfig, target_account_id: int | None = None) -> str:
+def upsert_record(
+    record: dict[str, Any],
+    cfg: DbConfig,
+    target_account_id: int | None = None,
+    expected_email: str | None = None,
+    force_email_mismatch: bool = False,
+) -> str:
+    if (
+        target_account_id is not None
+        and expected_email
+        and record["email"].lower() != expected_email.lower()
+        and not force_email_mismatch
+    ):
+        raise ValueError(
+            f"session token returned email {record['email']!r}, "
+            f"but target account id={target_account_id} is {expected_email!r}; "
+            "use --force-email-mismatch to override"
+        )
+
     sql = r"""
 BEGIN;
 
@@ -263,11 +292,11 @@ updated AS (
       a.credentials
       || jsonb_build_object(
         'access_token', i.p->>'access_token',
-        'session_token', i.p->>'session_token',
         'expires_at', i.exp,
         'email', i.email,
         'model_mapping', COALESCE(a.credentials->'model_mapping', m.model_mapping)
       )
+      || CASE WHEN i.p ? 'session_token' THEN jsonb_build_object('session_token', i.p->>'session_token') ELSE '{}'::jsonb END
       || CASE WHEN i.p ? 'id_token' THEN jsonb_build_object('id_token', i.p->>'id_token') ELSE '{}'::jsonb END
       || CASE WHEN i.p ? 'client_id' THEN jsonb_build_object('client_id', i.p->>'client_id') ELSE '{}'::jsonb END
       || CASE WHEN i.p ? 'chatgpt_user_id' THEN jsonb_build_object('chatgpt_user_id', i.p->>'chatgpt_user_id') ELSE '{}'::jsonb END
@@ -279,9 +308,9 @@ updated AS (
       || jsonb_build_object(
         'email', i.email,
         'access_token_sha256', i.p->>'access_token_sha256',
-        'session_token_sha256', i.p->>'session_token_sha256',
-        'session_token_updated_at', now()
+        'access_token_updated_at', now()
       )
+      || CASE WHEN i.p ? 'session_token_sha256' THEN jsonb_build_object('session_token_sha256', i.p->>'session_token_sha256', 'session_token_updated_at', now()) ELSE '{}'::jsonb END
       || CASE WHEN NOT (a.extra ? 'privacy_mode') THEN jsonb_build_object('privacy_mode', 'training_off') ELSE '{}'::jsonb END
       || CASE WHEN NOT (a.extra ? 'openai_oauth_responses_websockets_v2_enabled') THEN jsonb_build_object('openai_oauth_responses_websockets_v2_enabled', false) ELSE '{}'::jsonb END
       || CASE WHEN NOT (a.extra ? 'openai_oauth_responses_websockets_v2_mode') THEN jsonb_build_object('openai_oauth_responses_websockets_v2_mode', 'off') ELSE '{}'::jsonb END,
@@ -321,11 +350,11 @@ inserted AS (
     'oauth',
     jsonb_build_object(
       'access_token', i.p->>'access_token',
-      'session_token', i.p->>'session_token',
       'expires_at', i.exp,
       'email', i.email,
       'model_mapping', m.model_mapping
     )
+    || CASE WHEN i.p ? 'session_token' THEN jsonb_build_object('session_token', i.p->>'session_token') ELSE '{}'::jsonb END
     || CASE WHEN i.p ? 'id_token' THEN jsonb_build_object('id_token', i.p->>'id_token') ELSE '{}'::jsonb END
     || CASE WHEN i.p ? 'client_id' THEN jsonb_build_object('client_id', i.p->>'client_id') ELSE '{}'::jsonb END
     || CASE WHEN i.p ? 'chatgpt_user_id' THEN jsonb_build_object('chatgpt_user_id', i.p->>'chatgpt_user_id') ELSE '{}'::jsonb END
@@ -335,14 +364,14 @@ inserted AS (
     jsonb_build_object(
       'email', i.email,
       'access_token_sha256', i.p->>'access_token_sha256',
-      'session_token_sha256', i.p->>'session_token_sha256',
       'privacy_mode', 'training_off',
       'openai_oauth_responses_websockets_v2_enabled', false,
       'openai_oauth_responses_websockets_v2_mode', 'off',
-      'import_source', 'session_token_helper',
+      'import_source', CASE WHEN i.p ? 'session_token' THEN 'session_token_helper' ELSE 'access_token_helper' END,
       'imported_at', now(),
-      'session_token_updated_at', now()
-    ),
+      'access_token_updated_at', now()
+    )
+    || CASE WHEN i.p ? 'session_token_sha256' THEN jsonb_build_object('session_token_sha256', i.p->>'session_token_sha256', 'session_token_updated_at', now()) ELSE '{}'::jsonb END,
     :'account_concurrency'::integer,
     :'account_priority'::integer,
     'active',
@@ -397,6 +426,9 @@ SELECT jsonb_build_object(
   'id', id,
   'name', name,
   'session_token', credentials->>'session_token',
+  'status', status,
+  'schedulable', schedulable,
+  'st_len', length(COALESCE(credentials->>'session_token', '')),
   'updated_at', updated_at
 )::text
 FROM public.accounts
@@ -415,6 +447,27 @@ ORDER BY id;
         if line and line not in {"BEGIN", "COMMIT"}:
             accounts.append(json.loads(line))
     return accounts
+
+
+def print_accounts(accounts: list[dict[str, Any]], selected_ord: set[int] | None = None) -> None:
+    if not accounts:
+        print("No revoked OpenAI OAuth accounts with session_token found.")
+        return
+
+    for account in accounts:
+        marker = "*" if selected_ord and account["ord"] in selected_ord else " "
+        print(
+            f"{marker} {account['ord']}. "
+            f"id={account['id']} {account['name']} "
+            f"status={account.get('status', '')} "
+            f"schedulable={account.get('schedulable', '')} "
+            f"st_len={account.get('st_len', '')}"
+        )
+
+
+def list_revoked(cfg: DbConfig) -> int:
+    print_accounts(revoked_accounts(cfg))
+    return 0
 
 
 def sql_literal(value: str) -> str:
@@ -452,18 +505,54 @@ def parse_selection(raw: str, total: int) -> list[int]:
     return deduped
 
 
-def update_revoked(selection: str, cfg: DbConfig) -> int:
+def parse_update_args(args: list[str]) -> tuple[str | None, int | None, bool]:
+    selection: str | None = None
+    account_id: int | None = None
+    force_email_mismatch = False
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--id":
+            i += 1
+            if i >= len(args):
+                raise ValueError("--id requires a database account id")
+            account_id = int(args[i])
+        elif arg.startswith("--id="):
+            account_id = int(arg.split("=", 1)[1])
+        elif arg == "--force-email-mismatch":
+            force_email_mismatch = True
+        elif selection is None:
+            selection = arg
+        else:
+            raise ValueError("too many arguments for update")
+        i += 1
+
+    if selection is not None and account_id is not None:
+        raise ValueError("use either update selection or update --id, not both")
+    return selection or "1", account_id, force_email_mismatch
+
+
+def update_revoked(
+    selection: str,
+    cfg: DbConfig,
+    account_id: int | None = None,
+    force_email_mismatch: bool = False,
+) -> int:
     accounts = revoked_accounts(cfg)
     if not accounts:
         print("No revoked OpenAI OAuth accounts with session_token found.")
         return 0
 
-    selected_ord = set(parse_selection(selection, len(accounts)))
-    selected = [account for account in accounts if account["ord"] in selected_ord]
-
-    for account in accounts:
-        marker = "*" if account["ord"] in selected_ord else " "
-        print(f"{marker} {account['ord']}. id={account['id']} {account['name']}")
+    if account_id is not None:
+        selected = [account for account in accounts if int(account["id"]) == account_id]
+        if not selected:
+            print_accounts(accounts)
+            raise ValueError(f"id={account_id} is not an update candidate")
+        selected_ord = {int(selected[0]["ord"])}
+    else:
+        selected_ord = set(parse_selection(selection, len(accounts)))
+        selected = [account for account in accounts if account["ord"] in selected_ord]
+    print_accounts(accounts, selected_ord)
 
     failures = 0
     for account in selected:
@@ -476,7 +565,20 @@ def update_revoked(selection: str, cfg: DbConfig) -> int:
             print(f"ERROR id={account['id']} {account['name']}: {exc}", file=sys.stdout)
             continue
 
-        print(upsert_record(record, cfg, target_account_id=int(account["id"])), end="")
+        try:
+            print(
+                upsert_record(
+                    record,
+                    cfg,
+                    target_account_id=int(account["id"]),
+                    expected_email=account["name"],
+                    force_email_mismatch=force_email_mismatch,
+                ),
+                end="",
+            )
+        except Exception as exc:
+            failures += 1
+            print(f"ERROR id={account['id']} {account['name']}: {exc}", file=sys.stdout)
 
     return 1 if failures else 0
 
@@ -487,6 +589,18 @@ def print_conversion(session_token: str) -> None:
     print()
     print(f"AT={data['accessToken']}")
     print(f"ST={data.get('sessionToken', '')}")
+
+
+def upsert_auto_token(token: str, cfg: DbConfig) -> None:
+    try:
+        record = access_token_record(token)
+    except Exception as at_exc:
+        try:
+            data = fetch_chatgpt_session(token)
+            record = token_record(data)
+        except Exception as st_exc:
+            raise ValueError(f"token is neither a valid access token nor a valid session token: {st_exc}") from at_exc
+    print(upsert_record(record, cfg), end="")
 
 
 def read_token_arg(args: list[str], label: str) -> str:
@@ -505,9 +619,11 @@ def read_token_arg(args: list[str], label: str) -> str:
 def usage() -> None:
     print(
         """Usage:
-  sub2api-helper <session_token>             Upsert OpenAI OAuth account from ChatGPT session token
-  sub2api-helper update [1|1,2,3|1-3|all]    Refresh revoked DB accounts that have session_token
-  sub2api-helper convert <session_token>     Only print ChatGPT session response
+  sub2api-helper <access_token|session_token>     Upsert account from access token or session token
+  sub2api-helper list                             List update candidates
+  sub2api-helper update [1|1,2,3|1-3|all]         Refresh revoked accounts by candidate number
+  sub2api-helper update --id <account_id>         Refresh one revoked account by database id
+  sub2api-helper convert <session_token>          Only print ChatGPT session response
 
 Environment:
   POSTGRES_CONTAINER=sub2api-postgres
@@ -516,6 +632,7 @@ Environment:
   GROUP_NAME=openai-default
   ACCOUNT_CONCURRENCY=10
   ACCOUNT_PRIORITY=1
+  PSQL_TIMEOUT=30
   DRY_RUN=1
 """
     )
@@ -534,18 +651,19 @@ def main() -> None:
             print_conversion(read_token_arg(args[1:], "ST"))
             return
 
+        if command == "list":
+            if len(args) > 1:
+                raise ValueError("too many arguments for list")
+            raise SystemExit(list_revoked(cfg))
+
         if command == "update":
-            selection = args[1] if len(args) > 1 else "1"
-            if len(args) > 2:
-                raise ValueError("too many arguments for update")
-            raise SystemExit(update_revoked(selection, cfg))
+            selection, account_id, force_email_mismatch = parse_update_args(args[1:])
+            raise SystemExit(update_revoked(selection, cfg, account_id, force_email_mismatch))
 
         if len(args) > 1:
             raise ValueError("too many arguments")
 
-        data = fetch_chatgpt_session(read_token_arg(args, "ST"))
-        record = token_record(data)
-        print(upsert_record(record, cfg), end="")
+        upsert_auto_token(read_token_arg(args, "Token"), cfg)
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc

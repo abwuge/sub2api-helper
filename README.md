@@ -11,14 +11,16 @@ ChatGPT session requests use [`zinzied/cloudscraper`](https://github.com/zinzied
 Run it on the host where sub2api is deployed:
 
 ```bash
-sub2api-helper '<session_token>'
+sub2api-helper '<access_token_or_session_token>'
+sub2api-helper list
 sub2api-helper update
+sub2api-helper update --id 6
 sub2api-helper update 1,2,3
 sub2api-helper update all
 sub2api-helper convert '<session_token>'
 ```
 
-`sub2api-helper <session_token>` fetches the current ChatGPT auth session, then upserts `access_token`, the returned `session_token`, expiration time, and account metadata into sub2api's `accounts.credentials` JSON.
+`sub2api-helper <token>` accepts either an OpenAI access token or a ChatGPT session token. Access tokens are decoded locally and update the matching account's `access_token` and expiration time. Session tokens fetch the current ChatGPT auth session, then upsert `access_token`, the returned `session_token`, expiration time, and account metadata into sub2api's `accounts.credentials` JSON.
 
 `sub2api-helper update` finds OpenAI OAuth accounts whose error is:
 
@@ -26,7 +28,7 @@ sub2api-helper convert '<session_token>'
 Token revoked (401): Your authentication token has been invalidated. Please try signing in again.
 ```
 
-It only considers rows that already have `credentials.session_token`. By default it updates the first match. Pass `1,2,3`, `1-3`, or `all` to update more.
+It only considers rows that already have `credentials.session_token`. Use `sub2api-helper list` to show candidates. By default `update` refreshes the first match. Pass `1,2,3`, `1-3`, `all`, or `--id <account_id>` to choose accounts.
 
 ## Configuration
 
@@ -39,6 +41,7 @@ POSTGRES_DB=sub2api
 GROUP_NAME=openai-default
 ACCOUNT_CONCURRENCY=10
 ACCOUNT_PRIORITY=1
+PSQL_TIMEOUT=30
 DRY_RUN=0
 ```
 
@@ -57,7 +60,11 @@ For a Linux x86_64 binary:
 
 ```bash
 uv sync --dev
-uv run pyinstaller --clean --onefile --name sub2api-helper --collect-data cloudscraper main.py
+uv run pyinstaller --clean --onedir --name sub2api-helper --collect-data cloudscraper main.py
 ```
 
-The binary is written to `dist/sub2api-helper`.
+The executable is written to `dist/sub2api-helper/sub2api-helper`. Keep the whole `dist/sub2api-helper` directory together when deploying.
+
+## 友情链接
+
+- [LINUX DO - 新的理想型社区](https://linux.do)
