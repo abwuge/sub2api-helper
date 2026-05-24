@@ -22,6 +22,8 @@ sub2api-helper convert '<session_token>'
 
 `sub2api-helper <token>` accepts either an OpenAI access token or a ChatGPT session token. Access tokens are decoded locally and update the matching account's `access_token` and expiration time. Session tokens fetch the current ChatGPT auth session, then upsert `access_token`, the returned `session_token`, expiration time, and account metadata into sub2api's `accounts.credentials` JSON.
 
+After a successful database update, the helper also calls sub2api's admin API to clear the account error, clear the OAuth token cache, and mark the account schedulable. This keeps sub2api's running process in sync with the database.
+
 `sub2api-helper update` finds OpenAI OAuth accounts whose error is:
 
 ```text
@@ -42,8 +44,18 @@ GROUP_NAME=openai-default
 ACCOUNT_CONCURRENCY=10
 ACCOUNT_PRIORITY=1
 PSQL_TIMEOUT=30
+SUB2API_BASE_URL=
+SUB2API_CONTAINER=sub2api
+SUB2API_PORT=8080
+SUB2API_TIMEOUT=10
+ADMIN_API_KEY=
+ADMIN_EMAIL=
+ADMIN_PASSWORD=
+SKIP_SUB2API_SYNC=0
 DRY_RUN=0
 ```
+
+When `SUB2API_BASE_URL` is empty, the helper discovers the sub2api container IP with `docker inspect`. If needed, set `SUB2API_BASE_URL=http://host:port` explicitly. Admin auth uses `ADMIN_API_KEY` when present, otherwise `ADMIN_EMAIL` and `ADMIN_PASSWORD` from the environment or local `.env`.
 
 Set `DRY_RUN=1` to run the database transaction and roll it back.
 

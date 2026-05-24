@@ -6,6 +6,8 @@ import os
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,6 +21,9 @@ DEFAULT_GROUP_NAME = "openai-default"
 DEFAULT_CONCURRENCY = 10
 DEFAULT_PRIORITY = 1
 DEFAULT_PSQL_TIMEOUT = 30
+DEFAULT_SUB2API_CONTAINER = "sub2api"
+DEFAULT_SUB2API_PORT = "8080"
+DEFAULT_SUB2API_TIMEOUT = 10
 REVOKED_ERROR = (
     "Token revoked (401): Your authentication token has been invalidated. "
     "Please try signing in again."
@@ -44,8 +49,54 @@ class PsqlOptions:
     unaligned: bool = False
 
 
+@dataclass
+class Sub2ApiConfig:
+    enabled: bool
+    base_url: str
+    container: str
+    port: str
+    timeout: int
+    admin_api_key: str
+    admin_email: str
+    admin_password: str
+
+
 def env_flag(name: str) -> bool:
     return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
+
+
+def env_disabled(name: str) -> bool:
+    return os.environ.get(name, "").lower() in {"0", "false", "no", "off"}
+
+
+def parse_env_file(path: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except FileNotFoundError:
+        return values
+
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def env_value(name: str, env_file: dict[str, str], default: str = "") -> str:
+    value = os.environ.get(name)
+    if value is not None:
+        return value
+    return env_file.get(name, default)
 
 
 def db_config() -> DbConfig:
@@ -58,6 +109,21 @@ def db_config() -> DbConfig:
         priority=int(os.environ.get("ACCOUNT_PRIORITY", DEFAULT_PRIORITY)),
         dry_run=env_flag("DRY_RUN"),
         psql_timeout=int(os.environ.get("PSQL_TIMEOUT", DEFAULT_PSQL_TIMEOUT)),
+    )
+
+
+def sub2api_config() -> Sub2ApiConfig:
+    env_file = parse_env_file(".env")
+    enabled = not env_flag("SKIP_SUB2API_SYNC") and not env_disabled("SUB2API_SYNC")
+    return Sub2ApiConfig(
+        enabled=enabled,
+        base_url=env_value("SUB2API_BASE_URL", env_file).rstrip("/"),
+        container=env_value("SUB2API_CONTAINER", env_file, DEFAULT_SUB2API_CONTAINER),
+        port=env_value("SUB2API_PORT", env_file, env_value("SERVER_PORT", env_file, DEFAULT_SUB2API_PORT)),
+        timeout=int(env_value("SUB2API_TIMEOUT", env_file, str(DEFAULT_SUB2API_TIMEOUT))),
+        admin_api_key=env_value("ADMIN_API_KEY", env_file),
+        admin_email=env_value("ADMIN_EMAIL", env_file),
+        admin_password=env_value("ADMIN_PASSWORD", env_file),
     )
 
 
@@ -214,6 +280,146 @@ def run_psql(sql: str, cfg: DbConfig, options: PsqlOptions | None = None) -> str
     return proc.stdout
 
 
+def parse_account_ids_from_upsert_output(output: str) -> list[int]:
+    ids: list[int] = []
+    for raw in output.splitlines():
+        line = raw.strip()
+        if not line or "|" not in line:
+            continue
+        parts = [part.strip() for part in line.split("|")]
+        if len(parts) < 2:
+            continue
+        try:
+            ids.append(int(parts[1]))
+        except ValueError:
+            continue
+    return ids
+
+
+def http_json(
+    url: str,
+    method: str = "GET",
+    body: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+    timeout: int = DEFAULT_SUB2API_TIMEOUT,
+) -> dict[str, Any]:
+    data = None
+    req_headers = dict(headers or {})
+    if body is not None:
+        data = json.dumps(body).encode()
+        req_headers.setdefault("Content-Type", "application/json")
+    req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")
+        raise RuntimeError(f"{method} {url} failed with HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"{method} {url} failed: {exc}") from exc
+
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{method} {url} returned non-JSON response: {raw[:200]}") from exc
+
+
+def discover_sub2api_base_url(cfg: Sub2ApiConfig) -> str:
+    if cfg.base_url:
+        return cfg.base_url
+
+    cmd = [
+        "docker",
+        "inspect",
+        "-f",
+        "{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}",
+        cfg.container,
+    ]
+    try:
+        proc = subprocess.run(cmd, text=True, capture_output=True, timeout=cfg.timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"docker inspect timed out after {cfg.timeout}s while discovering sub2api address") from exc
+
+    if proc.returncode != 0:
+        message = proc.stderr.strip() or proc.stdout.strip()
+        raise RuntimeError(
+            "cannot discover sub2api address; set SUB2API_BASE_URL or fix docker inspect: "
+            f"{message}"
+        )
+
+    ips = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    if not ips:
+        raise RuntimeError("cannot discover sub2api address; set SUB2API_BASE_URL")
+    return f"http://{ips[0]}:{cfg.port}".rstrip("/")
+
+
+def sub2api_admin_headers(cfg: Sub2ApiConfig, base_url: str | None = None) -> dict[str, str]:
+    if cfg.admin_api_key:
+        return {"x-api-key": cfg.admin_api_key}
+    if not cfg.admin_email or not cfg.admin_password:
+        raise RuntimeError(
+            "sub2api admin credentials are missing; set ADMIN_API_KEY or ADMIN_EMAIL/ADMIN_PASSWORD, "
+            "or set SKIP_SUB2API_SYNC=1"
+        )
+
+    data = http_json(
+        f"{base_url or discover_sub2api_base_url(cfg)}/api/v1/auth/login",
+        method="POST",
+        body={"email": cfg.admin_email, "password": cfg.admin_password},
+        timeout=cfg.timeout,
+    )
+    access_token = ""
+    payload = data.get("data")
+    if isinstance(payload, dict):
+        access_token = str(payload.get("access_token") or "")
+    if not access_token:
+        raise RuntimeError(f"sub2api login response does not contain access_token: {data}")
+    return {"Authorization": f"Bearer {access_token}"}
+
+
+def sync_sub2api_account_state(account_ids: list[int], cfg: Sub2ApiConfig) -> None:
+    if not cfg.enabled or not account_ids:
+        return
+    base_url = discover_sub2api_base_url(cfg)
+    headers = sub2api_admin_headers(cfg, base_url)
+    for account_id in account_ids:
+        http_json(
+            f"{base_url}/api/v1/admin/accounts/{account_id}/clear-error",
+            method="POST",
+            headers=headers,
+            timeout=cfg.timeout,
+        )
+        http_json(
+            f"{base_url}/api/v1/admin/accounts/{account_id}/schedulable",
+            method="POST",
+            body={"schedulable": True},
+            headers=headers,
+            timeout=cfg.timeout,
+        )
+
+
+def upsert_record_and_sync(
+    record: dict[str, Any],
+    cfg: DbConfig,
+    sub2api_cfg: Sub2ApiConfig,
+    target_account_id: int | None = None,
+    expected_email: str | None = None,
+    force_email_mismatch: bool = False,
+) -> str:
+    output = upsert_record(
+        record,
+        cfg,
+        target_account_id=target_account_id,
+        expected_email=expected_email,
+        force_email_mismatch=force_email_mismatch,
+    )
+    if not cfg.dry_run:
+        sync_sub2api_account_state(parse_account_ids_from_upsert_output(output), sub2api_cfg)
+    return output
+
+
 def upsert_record(
     record: dict[str, Any],
     cfg: DbConfig,
@@ -316,7 +522,7 @@ updated AS (
       || CASE WHEN NOT (a.extra ? 'openai_oauth_responses_websockets_v2_mode') THEN jsonb_build_object('openai_oauth_responses_websockets_v2_mode', 'off') ELSE '{}'::jsonb END,
     expires_at = i.expires_at,
     status = 'active',
-    error_message = NULL,
+    error_message = '',
     schedulable = true,
     rate_limited_at = NULL,
     rate_limit_reset_at = NULL,
@@ -535,6 +741,7 @@ def parse_update_args(args: list[str]) -> tuple[str | None, int | None, bool]:
 def update_revoked(
     selection: str,
     cfg: DbConfig,
+    sub2api_cfg: Sub2ApiConfig,
     account_id: int | None = None,
     force_email_mismatch: bool = False,
 ) -> int:
@@ -567,9 +774,10 @@ def update_revoked(
 
         try:
             print(
-                upsert_record(
+                upsert_record_and_sync(
                     record,
                     cfg,
+                    sub2api_cfg,
                     target_account_id=int(account["id"]),
                     expected_email=account["name"],
                     force_email_mismatch=force_email_mismatch,
@@ -591,7 +799,7 @@ def print_conversion(session_token: str) -> None:
     print(f"ST={data.get('sessionToken', '')}")
 
 
-def upsert_auto_token(token: str, cfg: DbConfig) -> None:
+def upsert_auto_token(token: str, cfg: DbConfig, sub2api_cfg: Sub2ApiConfig) -> None:
     try:
         record = access_token_record(token)
     except Exception as at_exc:
@@ -600,7 +808,7 @@ def upsert_auto_token(token: str, cfg: DbConfig) -> None:
             record = token_record(data)
         except Exception as st_exc:
             raise ValueError(f"token is neither a valid access token nor a valid session token: {st_exc}") from at_exc
-    print(upsert_record(record, cfg), end="")
+    print(upsert_record_and_sync(record, cfg, sub2api_cfg), end="")
 
 
 def read_token_arg(args: list[str], label: str) -> str:
@@ -633,6 +841,14 @@ Environment:
   ACCOUNT_CONCURRENCY=10
   ACCOUNT_PRIORITY=1
   PSQL_TIMEOUT=30
+  SUB2API_BASE_URL=
+  SUB2API_CONTAINER=sub2api
+  SUB2API_PORT=8080
+  SUB2API_TIMEOUT=10
+  ADMIN_API_KEY=
+  ADMIN_EMAIL=
+  ADMIN_PASSWORD=
+  SKIP_SUB2API_SYNC=1
   DRY_RUN=1
 """
     )
@@ -645,6 +861,7 @@ def main() -> None:
         return
 
     cfg = db_config()
+    sub2api_cfg = sub2api_config()
     command = args[0]
     try:
         if command == "convert":
@@ -658,12 +875,12 @@ def main() -> None:
 
         if command == "update":
             selection, account_id, force_email_mismatch = parse_update_args(args[1:])
-            raise SystemExit(update_revoked(selection, cfg, account_id, force_email_mismatch))
+            raise SystemExit(update_revoked(selection, cfg, sub2api_cfg, account_id, force_email_mismatch))
 
         if len(args) > 1:
             raise ValueError("too many arguments")
 
-        upsert_auto_token(read_token_arg(args, "Token"), cfg)
+        upsert_auto_token(read_token_arg(args, "Token"), cfg, sub2api_cfg)
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
